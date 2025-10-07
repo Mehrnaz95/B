@@ -35,6 +35,7 @@ from data_utils import (
     apply_channel_norm,
     phase_corr_init_from_ds,
 )
+from utils import ensure_dirs, set_seed
 from train_eval import train_full, eval_test, overlay_examples, save_phase_adjacency_plots
 
 
@@ -44,7 +45,8 @@ from train_eval import train_full, eval_test, overlay_examples, save_phase_adjac
 
 def main():
     cfg = Config()
-    os.makedirs(cfg.out_dir, exist_ok=True)
+    ensure_dirs(cfg.out_dir) 
+    set_seed(cfg.master_seed)
     print("Device:", cfg.device)
 
     # ----------------------------------------------------------
