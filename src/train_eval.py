@@ -20,14 +20,16 @@ Notes:
 - Synthetic and real runs differ only in data sources and number of channels.
 """
 
-import os, math, csv
+
+import os, csv, math
 import numpy as np
-import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
 
 from model import PS_APM_Seq
+from utils import save_heatmap, set_seed, ensure_dirs
 
 
 # ==============================================================
