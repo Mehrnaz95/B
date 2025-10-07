@@ -329,3 +329,45 @@ def phase_corr_init_from_ds(ds, train_trials: List[int]) -> List[np.ndarray]:
         np.fill_diagonal(C, 0.0)
         C_list.append(np.nan_to_num(C).astype(np.float32))
     return C_list
+
+
+# ==============================================================
+#  ----------  GRAPH RECOVERY METRICS  ----------
+# ==============================================================
+
+def evaluate_graph_recovery(A_learned, A_gt, top_k=2):
+    """
+    Evaluate adjacency recovery for each phase using:
+        (1) Pearson correlation between |A_hat| and |A_gt|
+        (2) F1@k_row: overlap of top-k edges per row
+    """
+    from scipy.stats import pearsonr
+
+    P = len(A_gt)
+    corr, f1 = [], []
+
+    for p in range(P):
+        A_true = np.abs(A_gt[p])
+        A_pred = np.abs(A_learned[p])
+
+        # correlation over off-diagonals
+        mask = ~np.eye(A_true.shape[0], dtype=bool)
+        r, _ = pearsonr(A_true[mask].ravel(), A_pred[mask].ravel())
+        corr.append(r)
+
+        # F1@k_row
+        f1_p = []
+        for i in range(A_true.shape[0]):
+            true_top = np.argsort(-A_true[i])[:top_k]
+            pred_top = np.argsort(-A_pred[i])[:top_k]
+            inter = len(set(true_top) & set(pred_top))
+            precision = inter / top_k
+            recall = inter / top_k
+            if precision + recall == 0:
+                f1_i = 0.0
+            else:
+                f1_i = 2 * precision * recall / (precision + recall)
+            f1_p.append(f1_i)
+        f1.append(np.mean(f1_p))
+
+    return {"corr": np.array(corr), "f1": np.array(f1)}
