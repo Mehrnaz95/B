@@ -54,14 +54,15 @@ def main():
     # 1) Generate ground-truth graphs (A_gt)
     # ----------------------------------------------------------
     print("Generating stochastic suite graphs (𝓓₁–𝓓₄)...")
-    A_gt = make_gt_graphs_stochastic(N=cfg.num_nodes, num_phases=cfg.num_phases)
+    A_gt = make_gt_graphs_stochastic(cfg)
+
     np.save(os.path.join(cfg.out_dir, "graphs", "A_gt.npy"), A_gt)
 
     # ----------------------------------------------------------
     # 2) Simulate non-Gaussian multivariate time series
     # ----------------------------------------------------------
     print("Simulating stochastic non-Gaussian trials...")
-    data, labels = simulate_stochastic_trials(A_gt, cfg)
+    data, labels = simulate_stochastic_trials(cfg, A_gt)
     print("Data shape:", data.shape, "| Labels shape:", labels.shape)
 
     # ----------------------------------------------------------
