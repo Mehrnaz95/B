@@ -1,127 +1,127 @@
-# main_real.py
 """
-Main training pipeline for BACE (Behavior-Adaptive Connectivity Estimation)
----------------------------------------------------------------------------
-This script runs the complete BACE model on real neural recordings.
+main_real.py
+-------------
+End-to-end example for running BACE on *real deep-brain recordings*.
 
-Notes:
-- No raw neural data are included in this repository for privacy reasons.
-- To reproduce, place your preprocessed MATLAB file under ./data/
-  with variable: neuralDataAllPhases_reordered ∈ R^(4 × trials × 80 × timepoints)
-- This script assumes the data are already downsampled to 1 kHz.
-- Statistical resampling procedures (bootstrap, reliability) are disabled here.
----------------------------------------------------------------------------
+This script follows the experimental setup described in Section 3.2
+(“Real Neural Data”) of the paper.  The dataset itself is not public,
+but the processing and model-training pipeline are fully reproducible.
 
-Usage:
-    python src/main_real.py
+Expected data format (private):
+    MATLAB .mat file  (see RealDataConfig in config.py)
+    shape: (phase, trial, channel, time)
+        phase   →  4 behavioral phases:  Wait, React, Reach, Return
+        channel →  80 channels (10 per region × 8 regions)
+        time    →  400 samples  (1 kHz segments)
+
+Outputs:
+    out/real/
+        ├── metrics/    loss curves, test MSE
+        ├── figs/       overlay plots, |A| heatmaps
+        └── graphs/     learned adjacency matrices
 """
 
 import os
+import numpy as np
+import h5py
 import torch
-from src.config import cfg
-from src.utils import set_seed, ensure_out_dirs, save_heatmap
-from src.data_utils import (
-    load_mat_trials,
-    split_by_trials,
-    compute_train_channel_stats,
-    apply_channel_norm,
-    SlidingForecastDataset,
-    make_loaders_from_trial_lists,
-)
-from src.model import PS_APM_Seq
-from src.train_eval import train_full, eval_test
 
+from config import RealDataConfig as Config
+from model import PS_APM_Seq
+from data_utils import (
+    SlidingForecastDataset,
+    split_by_trials,
+    compute_channel_stats,
+    apply_channel_norm,
+    phase_corr_init_from_ds,
+)
+from train_eval import train_full, eval_test, overlay_examples, save_phase_adjacency_plots
+
+
+# ==============================================================
+#  ----------  MAIN  ----------
+# ==============================================================
 
 def main():
-    # -------------------------------------------------------------------------
-    # 1. Setup and configuration
-    # -------------------------------------------------------------------------
-    print("\n=== BACE: Behavior-Adaptive Connectivity Estimation (Real Data) ===\n")
+    cfg = Config()
+    os.makedirs(cfg.out_dir, exist_ok=True)
+    print("Device:", cfg.device)
 
-    set_seed(cfg.master_seed)
-    cfg.out_dir = "./out_real"
-    ensure_out_dirs(cfg)
+    # ----------------------------------------------------------
+    # 1) Load private MATLAB dataset (structure only)
+    # ----------------------------------------------------------
+    # Replace mat_path with your own data location.
+    # Example (not public):
+    #     D:/PrivateData/AllPhases_CleanReordered.mat
+    #
+    # The array should be named 'neuralDataAllPhases_reordered'
+    # and have shape (4, trials, 80, 400).
+    print("Loading real neural data...")
+    with h5py.File(cfg.mat_path, "r") as f:
+        data_raw = np.array(f["neuralDataAllPhases_reordered"])  # (4, trials, 80, 400)
 
-    # Public-safe placeholder path (edit locally as needed)
-    cfg.mat_path = "./data/AllPhases_CleanReordered.mat"
+    # transpose to (phase, trial, channel, time) if needed
+    data = np.transpose(data_raw, (0, 1, 2, 3)).astype(np.float32)
+    num_phases, num_trials, num_ch, T = data.shape
+    assert num_phases == 4 and num_ch == cfg.num_channels_total
 
-    if not os.path.exists(cfg.mat_path):
-        raise FileNotFoundError(
-            f"Expected .mat file not found at {cfg.mat_path}\n"
-            "Please place your preprocessed data under ./data/."
-        )
+    # reshape to (all_trials, 80, 400)
+    data = data.reshape(num_phases * num_trials, num_ch, T)
+    labels = np.repeat(np.arange(num_phases), num_trials).astype(np.int64)
 
-    # -------------------------------------------------------------------------
-    # 2. Load and prepare data
-    # -------------------------------------------------------------------------
-    print("Loading data...")
-    data, labels = load_mat_trials(cfg.mat_path)   # already 1 kHz, [Ttot, 80, T]
-    print(f"Loaded {data.shape[0]} trials × {data.shape[1]} channels × {data.shape[2]} timepoints")
+    # ----------------------------------------------------------
+    # 2) Split into train / val / test (phase-balanced)
+    # ----------------------------------------------------------
+    train_ids, val_ids, test_ids = split_by_trials(labels, seed=cfg.master_seed)
+    print(f"Trials per phase: {num_trials} | Train {len(train_ids)}, Val {len(val_ids)}, Test {len(test_ids)}")
 
-    # Split trials reproducibly
-    train_trials, val_trials, test_trials = split_by_trials(labels, seed=cfg.master_seed)
-    print(f"Split trials → train {len(train_trials)}, val {len(val_trials)}, test {len(test_trials)}")
+    # ----------------------------------------------------------
+    # 3) Standardize per channel (z-scoring on train only)
+    # ----------------------------------------------------------
+    ch_mean, ch_std = compute_channel_stats(
+        data.reshape(-1, cfg.num_regions, cfg.chans_per_region, T), train_ids
+    )
+    data_z = apply_channel_norm(
+        data.reshape(-1, cfg.num_regions, cfg.chans_per_region, T), ch_mean, ch_std
+    )
 
-    # Channel-wise z-score using train set
-    ch_mean, ch_std = compute_train_channel_stats(data, train_trials)
-    data_z = apply_channel_norm(data, ch_mean, ch_std)
-
-    # -------------------------------------------------------------------------
-    # 3. Dataset and loaders
-    # -------------------------------------------------------------------------
+    # ----------------------------------------------------------
+    # 4) Dataset + DataLoaders
+    # ----------------------------------------------------------
     ds = SlidingForecastDataset(
-        data_z, labels, cfg.region_to_channels,
+        data_z, labels, N=cfg.num_regions, C=cfg.chans_per_region,
         T_in=cfg.T_in, T_out=cfg.T_out, stride=cfg.stride
     )
-    train_loader, val_loader, test_loader = make_loaders_from_trial_lists(
-        ds, train_trials, val_trials, test_trials
+    from data_utils import make_loaders_from_trials
+    train_loader, val_loader, test_loader = make_loaders_from_trials(
+        ds, train_ids, val_ids, test_ids, batch_size=cfg.batch_size, device=cfg.device
     )
 
-    print(f"Prepared {len(train_loader.dataset)} training windows "
-          f"and {len(test_loader.dataset)} test windows.\n")
+    # ----------------------------------------------------------
+    # 5) Initialize model and correlation-based graph priors
+    # ----------------------------------------------------------
+    model = PS_APM_Seq(N=cfg.num_regions, C=cfg.chans_per_region, cfg=cfg).to(cfg.device)
+    C_list = phase_corr_init_from_ds(ds, train_ids)
+    model.graphs.init_from_correlation(C_list)
 
-    # -------------------------------------------------------------------------
-    # 4. Model initialization
-    # -------------------------------------------------------------------------
-    model = PS_APM_Seq(N=ds.N, C=ds.C, cfg=cfg).to(cfg.device)
-    param_count = sum(p.numel() for p in model.parameters()) / 1e6
-    print(f"Model initialized ({param_count:.2f}M parameters, device={cfg.device})")
-
-    # -------------------------------------------------------------------------
-    # 5. Training
-    # -------------------------------------------------------------------------
-    print("\n--- Training ---")
+    # ----------------------------------------------------------
+    # 6) Train + Evaluate
+    # ----------------------------------------------------------
     train_full(model, train_loader, val_loader, cfg)
+    eval_test(model, test_loader, cfg)
 
-    # -------------------------------------------------------------------------
-    # 6. Evaluation
-    # -------------------------------------------------------------------------
-    print("\n--- Evaluation ---")
-    mse, mse_bl, gain = eval_test(model, test_loader, cfg)
-    print(f"Test MSE: {mse:.4e} | Baseline: {mse_bl:.4e} | Gain: {gain:.1f}%")
+    # ----------------------------------------------------------
+    # 7) Visualizations (Fig. 8-style)
+    # ----------------------------------------------------------
+    overlay_examples(model, ds, test_loader, cfg, region_idx=0)
+    save_phase_adjacency_plots(model, cfg, region_labels=list(cfg.region_to_channels.keys()))
 
-    # -------------------------------------------------------------------------
-    # 7. Save learned adjacency matrices (phase-specific graphs)
-    # -------------------------------------------------------------------------
-    A_eff = model.graphs.export_all(effective=True)
-    os.makedirs(os.path.join(cfg.out_dir, "graphs"), exist_ok=True)
-    os.makedirs(os.path.join(cfg.out_dir, "figs"), exist_ok=True)
-    torch.save(A_eff, os.path.join(cfg.out_dir, "graphs", "A_effective.pt"))
+    print("Done. Results saved under:", cfg.out_dir)
 
-    for p in range(4):
-        save_heatmap(
-            abs(A_eff[p]),
-            os.path.join(cfg.out_dir, "figs", f"learned_A_phase{p}.png"),
-            f"|A| (Phase = {cfg.phases[p]})",
-            labels=list(cfg.region_to_channels.keys()),
-            vmin=0, vmax=abs(A_eff).max()
-        )
 
-    print("\nSaved results under:", cfg.out_dir)
-    print(" - metrics/: training & test losses")
-    print(" - figs/: learned |A| per phase")
-    print(" - graphs/: adjacency arrays\n")
-
+# ==============================================================
+#  Entry Point
+# ==============================================================
 
 if __name__ == "__main__":
     main()
