@@ -1,83 +1,117 @@
-# train_eval.py
+# -*- coding: utf-8 -*-
 """
-Training and evaluation utilities for BACE
-------------------------------------------
-Contains:
-- train_full(): end-to-end model optimization
-- eval_test(): compute test and baseline MSE
-- save_curves(): visualize training/validation loss
-------------------------------------------
-This version is anonymized and data-agnostic: it uses the modular
-model, config, and dataset without any patient data references.
+train_eval.py
+--------------
+Training and evaluation routines shared by all experiments
+(Structured suite, Stochastic suite, and Real neural data).
+
+Implements:
+    • train_full()   : core training loop with early stopping
+    • eval_test()    : quantitative test evaluation
+    • overlay_examples() : visualization of predicted vs. true trajectories
+    • save_phase_adjacency_plots() : saves learned adjacency heatmaps
+
+This file corresponds to the procedures described in
+Sections 3.1–3.2 ("Synthetic Data: Recovery of Ground-Truth Connectivity"
+and "Real Neural Data") of the paper.
+
+Notes:
+- No statistical or bootstrap analyses are included here.
+- Synthetic and real runs differ only in data sources and number of channels.
 """
 
-import os
-import math
-import csv
-import torch
-import torch.nn.functional as F
+import os, math, csv
+import numpy as np
 import matplotlib.pyplot as plt
-from src.utils import ensure_out_dirs
-from src.model import L1_on_S
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-# =============================================================================
-# 1. Training Loop
-# =============================================================================
+from model import PS_APM_Seq
 
-def train_full(model, train_loader, val_loader, cfg):
+
+# ==============================================================
+#  ----------  TRAINING LOOP  ----------
+# ==============================================================
+
+def train_full(model: PS_APM_Seq, train_loader, val_loader, cfg):
     """
-    End-to-end model training with early stopping on validation loss.
+    Train the model end-to-end for forecasting-based graph learning.
+    Early stopping based on validation MSE.
     """
-    ensure_out_dirs(cfg)
+    os.makedirs(os.path.join(cfg.out_dir, "metrics"), exist_ok=True)
+    os.makedirs(os.path.join(cfg.out_dir, "figs"), exist_ok=True)
+
     opt = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    best_val, patience = float("inf"), 0
+    train_hist, val_hist = [], []
 
-    best_val = float("inf")
-    patience = 0
-    train_losses, val_losses = []
-
-    for epoch in range(1, cfg.num_epochs + 1):
+    for ep in range(1, cfg.num_epochs + 1):
         model.train()
-        running_loss = 0.0
+        run_loss = 0.0
         for X_in, Y_out, phases in train_loader:
-            X_in, Y_out, phases = X_in.to(cfg.device), Y_out.to(cfg.device), phases.to(cfg.device)
+            X_in = X_in.to(cfg.device)
+            Y_out = Y_out.to(cfg.device)
+            phases = phases.to(cfg.device)
 
-            # Forward pass
-            Y_hat, y1 = model(X_in, phases, teacher=None, sched_p=0.0, use_neigh=True)
-            
-            # Main loss: weighted MSE across prediction horizon
+            # simple schedule for teacher forcing (optional)
+            sched_p = max(0.0, 0.5 * (1 - (ep - 1) / max(1, cfg.num_epochs - 1)))
+
+            # forward pass
+            Y_hat = model(X_in, phases, teacher=None, sched_p=0.0, use_neigh=True)
+
+            # forecast loss (weighted over horizon)
             gamma = 3.0
             w = torch.logspace(0, math.log10(gamma), steps=cfg.T_out, device=cfg.device)
-            l_mse = ((Y_hat - Y_out) ** 2 * w.view(1, 1, 1, -1)).mean()
+            loss_pred = ((Y_hat - Y_out) ** 2 * w.view(1, 1, 1, -1)).mean()
 
-            # Regularization terms
+            # auxiliary continuity / velocity / curvature losses
+            x_last = X_in[..., -1]
+            loss_cont = F.mse_loss(Y_hat[..., 0], x_last)
+
+            d_pred = Y_hat[..., 1:] - Y_hat[..., :-1]
+            d_true = Y_out[..., 1:] - Y_out[..., :-1]
+            loss_vel = F.mse_loss(d_pred[..., 0], d_true[..., 0])
+            curv_pred = d_pred[..., 1:] - d_pred[..., :-1]
+            curv_true = d_true[..., 1:] - d_true[..., :-1]
+            loss_curv = F.mse_loss(curv_pred, curv_true)
+
+            # sparsity on graph weights
+            S = model.graphs.S
+            I = torch.eye(S.size(-1), device=S.device)
+            l1_s = (S.abs() * (1.0 - I)).sum()
+
+            # total loss
             loss = (
-                l_mse
-                + cfg.lambda_Sraw * L1_on_S(model.graphs)
-                + cfg.lambda_cont * F.mse_loss(Y_hat[..., 0], X_in[..., -1])
-                + cfg.lambda_vel * _velocity_loss(X_in, Y_hat, Y_out)
-                + cfg.lambda_curv * _curvature_loss(X_in, Y_hat, Y_out)
+                loss_pred
+                + cfg.lambda_Sraw * l1_s
+                + cfg.lambda_cont * loss_cont
+                + cfg.lambda_vel  * loss_vel
+                + cfg.lambda_curv * loss_curv
             )
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             opt.step()
 
-            running_loss += loss.item()
+            run_loss += loss.item()
 
-        # Validation
+        # validation
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
             for X_in, Y_out, phases in val_loader:
-                X_in, Y_out, phases = X_in.to(cfg.device), Y_out.to(cfg.device), phases.to(cfg.device)
-                Y_hat, _ = model(X_in, phases, use_neigh=True)
-                val_loss += F.mse_loss(Y_hat, Y_out, reduction='mean').item()
+                X_in = X_in.to(cfg.device)
+                Y_out = Y_out.to(cfg.device)
+                phases = phases.to(cfg.device)
+                Y_hat = model(X_in, phases, use_neigh=True)
+                val_loss += F.mse_loss(Y_hat, Y_out, reduction="mean").item()
         val_loss /= max(1, len(val_loader))
 
-        # Early stopping
-        train_losses.append(running_loss / max(1, len(train_loader)))
-        val_losses.append(val_loss)
+        train_hist.append(run_loss / max(1, len(train_loader)))
+        val_hist.append(val_loss)
+
         if val_loss < best_val - cfg.es_min_delta:
             best_val = val_loss
             patience = 0
@@ -85,92 +119,147 @@ def train_full(model, train_loader, val_loader, cfg):
         else:
             patience += 1
             if patience >= cfg.es_patience:
-                print(f"Early stopping at epoch {epoch}")
                 break
 
-        if epoch == 1 or epoch % 5 == 0:
-            print(f"[Epoch {epoch:03d}] Train={train_losses[-1]:.4f}, Val={val_loss:.4f}")
+        if ep == 1 or ep % 5 == 0:
+            print(f"[Ep {ep:03d}] train {train_hist[-1]:.4f}  val {val_hist[-1]:.4f}")
 
-    save_curves(train_losses, val_losses, cfg)
-    return train_losses, val_losses
-
-
-# =============================================================================
-# 2. Evaluation
-# =============================================================================
-
-def eval_test(model, test_loader, cfg):
-    """
-    Evaluate test performance and compare to copy-last baseline.
-    """
-    model.eval()
-    mse, mse_bl = 0.0, 0.0
-    n = 0
-
-    with torch.no_grad():
-        for X_in, Y_out, phases in test_loader:
-            X_in, Y_out, phases = X_in.to(cfg.device), Y_out.to(cfg.device), phases.to(cfg.device)
-            Y_hat, _ = model(X_in, phases)
-            mse += F.mse_loss(Y_hat, Y_out, reduction='sum').item()
-            # copy-last baseline
-            bl = X_in[:, :, :, -1:].repeat(1, 1, 1, cfg.T_out)
-            mse_bl += F.mse_loss(bl, Y_out, reduction='sum').item()
-            n += Y_out.numel()
-
-    mse /= n
-    mse_bl /= n
-    gain = 100 * (1 - mse / mse_bl)
-
-    # Save metrics
-    os.makedirs(os.path.join(cfg.out_dir, "metrics"), exist_ok=True)
-    with open(os.path.join(cfg.out_dir, "metrics", "test_mse.txt"), "w") as f:
-        f.write(f"Test MSE: {mse:.6e}\n")
-        f.write(f"Copy-last baseline: {mse_bl:.6e}\n")
-        f.write(f"Relative gain: {gain:.2f}%\n")
-
-    print(f"[Test] MSE={mse:.3e}, Baseline={mse_bl:.3e}, Gain={gain:.1f}%")
-    return mse, mse_bl, gain
-
-
-# =============================================================================
-# 3. Auxiliary Losses
-# =============================================================================
-
-def _velocity_loss(X_in, Y_hat, Y_out):
-    """Match initial velocity between prediction and target."""
-    x_last = X_in[..., -1]
-    d_pred = Y_hat[..., 0] - x_last
-    d_true = Y_out[..., 0] - x_last
-    return F.mse_loss(d_pred, d_true)
-
-
-def _curvature_loss(X_in, Y_hat, Y_out):
-    """Match second differences (curvature) across time."""
-    def second_diff(x):
-        return x[..., 2:] - 2 * x[..., 1:-1] + x[..., :-2]
-    return F.mse_loss(second_diff(Y_hat), second_diff(Y_out))
-
-
-# =============================================================================
-# 4. Visualization
-# =============================================================================
-
-def save_curves(train_losses, val_losses, cfg):
-    """Save training and validation loss curves."""
-    os.makedirs(os.path.join(cfg.out_dir, "figs"), exist_ok=True)
+    # save curves
     plt.figure()
-    plt.plot(train_losses, label="Train")
-    plt.plot(val_losses, label="Validation")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
+    plt.plot(train_hist, label="train")
+    plt.plot(val_hist, label="val")
+    plt.xlabel("epoch")
+    plt.ylabel("loss (MSE, z-domain)")
     plt.legend()
     plt.tight_layout()
     plt.savefig(os.path.join(cfg.out_dir, "figs", "loss_curves.png"), dpi=150)
     plt.close()
 
-    # Save numeric log
     with open(os.path.join(cfg.out_dir, "metrics", "losses.csv"), "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["epoch", "train", "val"])
-        for i, (a, b) in enumerate(zip(train_losses, val_losses), 1):
-            writer.writerow([i, a, b])
+        w = csv.writer(f)
+        w.writerow(["epoch", "train", "val"])
+        for i, (tr, va) in enumerate(zip(train_hist, val_hist), 1):
+            w.writerow([i, tr, va])
+
+    # reload best
+    state = torch.load(os.path.join(cfg.out_dir, "graphs", "best.pt"), map_location=cfg.device)
+    model.load_state_dict(state)
+
+
+# ==============================================================
+#  ----------  EVALUATION  ----------
+# ==============================================================
+
+def eval_test(model: PS_APM_Seq, test_loader, cfg):
+    """
+    Evaluate forecasting performance and baseline comparison.
+
+    Writes test MSE, baseline MSE (copy-last), and % gain.
+    """
+    model.eval()
+    sse, count = 0.0, 0
+    with torch.no_grad():
+        for X_in, Y_out, phases in test_loader:
+            X_in = X_in.to(cfg.device)
+            Y_out = Y_out.to(cfg.device)
+            phases = phases.to(cfg.device)
+            Y_hat = model(X_in, phases)
+            sse += F.mse_loss(Y_hat, Y_out, reduction="sum").item()
+            count += Y_out.numel()
+    mse = sse / count
+
+    # copy-last baseline
+    sse_bl, count_bl = 0.0, 0
+    with torch.no_grad():
+        for X_in, Y_out, _ in test_loader:
+            X_in = X_in.to(cfg.device)
+            Y_out = Y_out.to(cfg.device)
+            bl = X_in[:, :, :, -1:].repeat(1, 1, 1, cfg.T_out)
+            sse_bl += F.mse_loss(bl, Y_out, reduction="sum").item()
+            count_bl += Y_out.numel()
+    mse_bl = sse_bl / count_bl
+    gain = 100 * (1 - mse / mse_bl)
+
+    with open(os.path.join(cfg.out_dir, "metrics", "test_mse.txt"), "w") as f:
+        f.write(f"Test MSE/element: {mse:.6e}\n")
+        f.write(f"Baseline copy-last MSE: {mse_bl:.6e}\n")
+        f.write(f"Gain over baseline: {gain:.1f}%\n")
+    print(f"[Test] MSE {mse:.6e} | Baseline {mse_bl:.6e} | Gain {gain:.1f}%")
+
+    return mse, mse_bl, gain
+
+
+# ==============================================================
+#  ----------  VISUALIZATION  ----------
+# ==============================================================
+
+def overlay_examples(model, ds, loader, cfg, region_idx=0, save_to=None):
+    """
+    Plot example trajectories per phase (mean across channels or single node).
+    """
+    os.makedirs(os.path.join(cfg.out_dir, "figs"), exist_ok=True)
+    labels = [f"R{i}" for i in range(ds.N)]
+    if save_to is None:
+        save_to = os.path.join(cfg.out_dir, "figs", "overlay_phase_examples.png")
+
+    fig, axs = plt.subplots(2, 2, figsize=(10, 7))
+    used = set()
+
+    model.eval()
+    with torch.no_grad():
+        for X_in, Y_out, phases in loader:
+            X_in = X_in.to(cfg.device)
+            Y_out = Y_out.to(cfg.device)
+            phases = phases.to(cfg.device)
+            Y_hat = model(X_in, phases)
+            B = X_in.shape[0]
+            for b in range(B):
+                p = int(phases[b].item())
+                if p in used:
+                    continue
+                ax = axs[p // 2, p % 2]
+                past = X_in[b, region_idx].mean(0).cpu().numpy()
+                true = Y_out[b, region_idx].mean(0).cpu().numpy()
+                pred = Y_hat[b, region_idx].mean(0).cpu().numpy()
+                t_p = np.arange(cfg.T_in)
+                t_f = np.arange(cfg.T_in, cfg.T_in + cfg.T_out)
+                ax.plot(t_p, past, lw=1.0, label="past")
+                ax.plot(t_f, true, lw=1.5, label="true")
+                ax.plot(t_f, pred, lw=1.5, ls="--", label="pred")
+                ax.set_title(f"{labels[region_idx]} | Phase {p}")
+                ax.grid(alpha=0.2)
+                used.add(p)
+                if len(used) >= 4:
+                    break
+            if len(used) >= 4:
+                break
+    h, l = axs[0, 0].get_legend_handles_labels()
+    fig.legend(h, l, loc="upper center", ncol=3)
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    plt.savefig(save_to, dpi=150)
+    plt.close()
+
+
+def save_phase_adjacency_plots(model, cfg, region_labels=None):
+    """
+    Save learned phase-specific adjacency heatmaps (|A|).
+    """
+    os.makedirs(os.path.join(cfg.out_dir, "graphs"), exist_ok=True)
+    os.makedirs(os.path.join(cfg.out_dir, "figs"), exist_ok=True)
+
+    A_eff = model.graphs.export_eff()  # [P,N,N]
+    np.save(os.path.join(cfg.out_dir, "graphs", "A_effective.npy"), A_eff)
+
+    vmax = np.max([np.abs(A_eff[p]).max() for p in range(A_eff.shape[0])]) + 1e-9
+    labels = region_labels if region_labels is not None else [f"R{i}" for i in range(A_eff.shape[1])]
+
+    for p in range(A_eff.shape[0]):
+        plt.figure(figsize=(6, 5))
+        plt.imshow(np.abs(A_eff[p]), aspect="equal", vmin=0, vmax=vmax, cmap="viridis")
+        plt.colorbar(fraction=0.046, pad=0.04)
+        plt.title(f"|A| (phase {p})")
+        plt.xticks(np.arange(len(labels)), labels, rotation=45, ha="right")
+        plt.yticks(np.arange(len(labels)), labels)
+        plt.tight_layout()
+        plt.savefig(os.path.join(cfg.out_dir, "figs", f"learned_A_phase{p}.png"), dpi=150)
+        plt.close()
