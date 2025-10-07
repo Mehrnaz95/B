@@ -48,14 +48,14 @@ def main():
     # 1) Generate ground-truth graphs (A_gt)
     # ----------------------------------------------------------
     print("Generating structured suite graphs (𝓓₁–𝓓₄)...")
-    A_gt = make_gt_graphs_structured(N=cfg.num_nodes, num_phases=cfg.num_phases)
+    A_gt = make_gt_graphs_structured(cfg)
     np.save(os.path.join(cfg.out_dir, "graphs", "A_gt.npy"), A_gt)
 
     # ----------------------------------------------------------
     # 2) Simulate synthetic multivariate time series
     # ----------------------------------------------------------
     print("Simulating synthetic trials...")
-    data, labels = simulate_structured_trials(A_gt, cfg)
+    data, labels = simulate_structured_trials(cfg, A_gt)
     print("Data shape:", data.shape, "| Labels shape:", labels.shape)
 
     # ----------------------------------------------------------
