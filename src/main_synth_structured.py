@@ -28,6 +28,7 @@ from data_utils import (
     SlidingForecastDataset,
     make_loaders_from_trials,
 )
+from utils import ensure_dirs, set_seed
 from train_eval import train_full, overlay_examples, save_phase_adjacency_plots
 
 
@@ -37,7 +38,8 @@ from train_eval import train_full, overlay_examples, save_phase_adjacency_plots
 
 def main():
     cfg = Config()
-    os.makedirs(cfg.out_dir, exist_ok=True)
+    ensure_dirs(cfg.out_dir)
+    set_seed(cfg.master_seed)
     print("Device:", cfg.device)
     torch.manual_seed(cfg.master_seed)
     np.random.seed(cfg.master_seed)
