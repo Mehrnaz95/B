@@ -231,12 +231,21 @@ class SlidingForecastDataset(Dataset):
         w_idx = idx % self.num_pairs_per_trial
         s = self.starts[w_idx]
         phase = int(self.labels[trial_idx])
-
-        trial = self.data[trial_idx]  # [N, C, T_total]
+    
+        trial = self.data[trial_idx]
+        # --- FIX: handle [N, T] or [N, C, T] automatically ---
+        if trial.ndim == 2:
+            trial = trial[:, None, :]  # add channel dim if missing
+    
         x = trial[:, :, s:s + self.T_in]
         y = trial[:, :, s + self.T_in:s + self.T_in + self.T_out]
+    
+        return (
+            torch.from_numpy(x).float(),
+            torch.from_numpy(y).float(),
+            torch.tensor(phase, dtype=torch.long),
+        )
 
-        return torch.from_numpy(x).float(), torch.from_numpy(y).float(), torch.tensor(phase, dtype=torch.long)
 
 
 # ==============================================================
