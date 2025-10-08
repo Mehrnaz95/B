@@ -56,6 +56,7 @@ def main():
     # ----------------------------------------------------------
     print("Simulating synthetic trials...")
     data, labels = simulate_structured_trials(cfg, A_gt)
+    data = data[:, :, None, :] 
     print("Data shape:", data.shape, "| Labels shape:", labels.shape)
 
     # ----------------------------------------------------------
