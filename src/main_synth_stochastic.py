@@ -63,6 +63,7 @@ def main():
     # ----------------------------------------------------------
     print("Simulating stochastic non-Gaussian trials...")
     data, labels = simulate_stochastic_trials(cfg, A_gt)
+    data = data[:, :, None, :] 
     print("Data shape:", data.shape, "| Labels shape:", labels.shape)
 
     # ----------------------------------------------------------
