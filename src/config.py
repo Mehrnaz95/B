@@ -12,8 +12,7 @@ shared conventions (batch size, learning rate, device, etc.) consistent.
 
 NOTE:
 - The real neural data used in the paper cannot be shared publicly.
-  The `RealDataConfig` therefore contains only placeholder paths and comments
-  describing the expected structure.
+  The `RealDataConfig` therefore contains only placeholder paths.
 - Synthetic configs reproduce the public synthetic results reported in the paper.
 """
 
@@ -24,7 +23,7 @@ from typing import Dict, List
 
 
 # ==============================================================
-#  Base configuration (shared knobs for all datasets)
+#  Base configuration (shared knobs)
 # ==============================================================
 
 @dataclass
@@ -38,7 +37,7 @@ class BaseConfig:
     grad_clip: float = 1.0
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Model dimensions
+    # Model dimensions (kept smaller for release)
     d_hidden: int = 64
     d_timectx: int = 8
     d_proj: int = 32
@@ -48,21 +47,22 @@ class BaseConfig:
     T_out: int = 20
     stride: int = 20
 
-    # Regularization weights (active terms only)
+    # Regularization weights (default; overridden below)
     lambda_Sraw: float = 1e-4
     lambda_cont: float = 0.0
     lambda_vel:  float = 1.0
     lambda_curv: float = 0.6
+    lambda_var:  float = 0.0
     use_row_gain: bool = True
 
-    # Reproducibility
+    # Reproducibility / early stopping
     master_seed: int = 0
     es_patience: int = 10
     es_min_delta: float = 1e-4
 
 
 # ==============================================================
-#  Real neural dataset (private)
+#  Real neural dataset (private placeholder)
 # ==============================================================
 
 @dataclass
@@ -70,19 +70,13 @@ class RealDataConfig(BaseConfig):
     """
     Configuration for real deep-brain recordings.
 
-    Expected input (private, not distributed):
-      • MATLAB .mat file containing a 4-D array:
-            shape = (phase, trial, channel, time)
-        where:
-            phase ∈ {0: Wait, 1: React, 2: Reach, 3: Return}
-            channel = 80  (10 electrodes per region × 8 regions)
-            time    ≈ 400 samples at 1 kHz  (downsampled)
-      • Each trial corresponds to a 400 ms segment per behavioral phase.
-
-    Update `mat_path` to point to your local copy of the dataset.
+    The private dataset (not shared) is stored as a MATLAB .mat file:
+        shape = (phase, trial, channel, time)
+    where  phase ∈ {0:Wait,1:React,2:Reach,3:Return},
+           channel = 80 (10 per region × 8 regions),
+           time ≈ 400 samples @1 kHz (downsampled offline).
     """
-
-    mat_path: str = "PATH/TO/AllPhases_CleanReordered.mat"   # placeholder
+    mat_path: str = "PATH/TO/AllPhases_CleanReordered.mat"
     out_dir: Path = Path("./out/real")
 
     num_trials_per_phase: int = 326
@@ -91,7 +85,6 @@ class RealDataConfig(BaseConfig):
     chans_per_region: int = 10
     phases: List[str] = ("Wait", "React", "Reach", "Return")
 
-    # Region mapping (adjust to match your dataset)
     region_to_channels: Dict[str, List[int]] = None
 
     def __post_init__(self):
@@ -109,55 +102,74 @@ class RealDataConfig(BaseConfig):
 
 
 # ==============================================================
-#  Structured synthetic dataset
+#  Structured synthetic dataset  (matches Code A)
 # ==============================================================
 
 @dataclass
 class SynthStructuredConfig(BaseConfig):
     """
-    Configuration for the structured synthetic suite.
+    Structured synthetic suite (VAR-based).
 
-    Synthetic generator:
-      x_{t+1} = A_phase * x_t + ε_t
-    where A_phase is a known directed VAR(1) matrix
-    (spectral radius < 1, zero diagonal), and ε_t ∼ N(0, σ²).
-
-    The generator creates 4 behavioral phases with distinct motifs
-    (hub, bilateral, hemispheric, etc.) for connectivity-recovery tasks.
+    Generator (Code A):
+        x_{t+1} = ρ·x_t + γ·A_φ·x_t + ε_t
+        ε_t ∼ 𝒩(0, σ² I)
+    where each A_φ (φ=1…4) has identical row degree (k=2)
+    with phase-shifted edges and zero diagonal.
     """
 
     out_dir: Path = Path("./out/synthetic_structured")
+
+    # Data generation
     num_nodes: int = 8
     num_phases: int = 4
-    trials_per_phase: int = 60
+    trials_per_phase: int = 326
     seq_len: int = 400
-    noise_std: float = 0.1
-    spectral_radius: float = 0.9
+    rho: float = 0.70              # leak term
+    gamma: float = 0.25            # coupling gain
+    sig_noise: float = 0.02        # Gaussian noise SD
+    spectral_radius: float = 0.9   # post-scaling target
+
+    # Training / regularization (Code A)
+    lambda_Sraw: float = 1e-4
+    lambda_cont: float = 0.08
+    lambda_vel:  float = 1.0
+    lambda_curv: float = 0.6
+    lambda_var:  float = 0.0
+
+    es_patience: int = 100
+    correlation_init: bool = True  # use correlation priors
 
 
 # ==============================================================
-#  Non-Gaussian (stochastic) synthetic dataset
+#  Non-Gaussian stochastic synthetic dataset
 # ==============================================================
 
 @dataclass
 class SynthStochasticConfig(BaseConfig):
     """
-    Configuration for the stochastic / non-Gaussian synthetic suite.
+    Stochastic / non-Gaussian suite.
 
-    Synthetic generator:
-      x_{t+1} = A_phase * tanh(x_t) + ε_t,
-    with ε_t drawn from a Laplace (non-Gaussian) distribution to
-    induce heavy-tailed noise and causal asymmetry.
-
-    This suite is used to evaluate graph learning under
-    non-linear and non-Gaussian dynamics.
+    Generator:
+        x_{t+1} = x_t + (−λI + γA_φ)x_t + μ_t,
+        μ_t autoregressive Laplace noise (colored, heavy-tailed).
     """
 
     out_dir: Path = Path("./out/synthetic_stochastic")
     num_nodes: int = 8
     num_phases: int = 4
-    trials_per_phase: int = 60
+    trials_per_phase: int = 326
     seq_len: int = 400
-    noise_scale: float = 0.1
+
+    # Noise and dynamics
+    leak_sim: float = 0.30
+    gamma_sim: float = 0.25
     laplace_scale: float = 0.5
+    noise_ar: float = 0.95
     spectral_radius: float = 0.9
+
+    # Regularization (lighter)
+    lambda_Sraw: float = 1e-4
+    lambda_cont: float = 0.08
+    lambda_vel:  float = 0.10
+    lambda_curv: float = 0.05
+    lambda_var:  float = 0.0
