@@ -26,7 +26,7 @@ from scipy.signal import lfilter
 
 
 # ==============================================================
-#  Utility: reproducibility
+#  Reproducibility
 # ==============================================================
 
 def set_seed(seed: int = 0):
@@ -41,55 +41,65 @@ def set_seed(seed: int = 0):
 # ==============================================================
 
 # --------------------------------------------------------------
-# Structured suite  (Section 3.1 – “structured suite”)
+# Structured suite  (AR(1) model — Code A)
 # --------------------------------------------------------------
 
-def make_gt_graphs_structured(cfg) -> List[np.ndarray]:
+def make_gt_graphs_structured(cfg) -> Tuple[List[np.ndarray], List[np.ndarray]]:
     """
-    Generate four structured ground-truth adjacency matrices A^(ϕ),
-    each with the same row degree (k=2) but shifted nonzero locations.
+    Generate 4 ground-truth adjacency matrices A^(φ)
+    using a ring + phase-shift pattern with k=2 outdegree per row.
 
-    These mimic visually structured but distinct connectivity motifs
-    as shown in Fig. 7B of the paper.
+    Each row connects to (i+1+p) and (i+2+p) mod N,
+    producing distinct motifs across phases.
+
+    Returns:
+        A_list : list of [N×N] float32 matrices
+        B_list : list of binary masks (A>0)
     """
     N, P = cfg.num_nodes, cfg.num_phases
-    A_list = []
+    A_list, B_list = [], []
     for p in range(P):
         A = np.zeros((N, N), dtype=np.float32)
         for i in range(N):
-            # two outgoing edges per row, shifted by phase index
-            for k in range(2):
-                j = (i + p + k + 1) % N
-                A[i, j] = np.random.uniform(0.4, 0.8)
+            j1 = (i + p + 1) % N
+            j2 = (i + p + 2) % N
+            A[i, j1] = 1.0
+            A[i, j2] = 1.0
         np.fill_diagonal(A, 0.0)
-        # scale to spectral radius
-        eigs = np.linalg.eigvals(A)
-        A = A / (max(abs(eigs)) / cfg.spectral_radius)
+
+        # row-normalize (L1 = 1)
+        A = A / A.sum(axis=1, keepdims=True)
+        B = (A > 0).astype(np.float32)
+
         A_list.append(A.astype(np.float32))
-    return A_list
+        B_list.append(B.astype(np.float32))
+    return A_list, B_list
 
 
 def simulate_structured_trials(cfg, A_list):
     """
-    Simulate time series x_{t+1} = A * x_t + ε_t  (Gaussian ε).
+    Simulate AR(1) process:
+        x_{t+1} = ρ·x_t + γ·A·x_t + ε_t
+    ε_t ~ N(0, σ² I)
 
     Returns:
-        X : [P * trials_per_phase, N, seq_len]
-        labels : [P * trials_per_phase]  (phase index)
+        X : [P·trials, N, seq_len]
+        labels : [P·trials]
     """
     N, P = cfg.num_nodes, cfg.num_phases
     T = cfg.seq_len
     n_trials = cfg.trials_per_phase
-    all_x, all_y = [], []
+    ρ, γ, σ = cfg.rho, cfg.gamma, cfg.sig_noise
 
+    all_x, all_y = [], []
     for p in range(P):
         A = A_list[p]
         for _ in range(n_trials):
             x = np.zeros((N, T), dtype=np.float32)
             x[:, 0] = np.random.randn(N) * 0.1
             for t in range(1, T):
-                noise = np.random.randn(N) * cfg.noise_std
-                x[:, t] = A @ x[:, t - 1] + noise
+                ε = np.random.randn(N).astype(np.float32) * σ
+                x[:, t] = ρ * x[:, t-1] + γ * (A @ x[:, t-1]) + ε
             all_x.append(x)
             all_y.append(p)
 
@@ -344,38 +354,40 @@ def phase_corr_init_from_ds(ds, train_trials: List[int]) -> List[np.ndarray]:
 #  ----------  GRAPH RECOVERY METRICS  ----------
 # ==============================================================
 
-def evaluate_graph_recovery(A_learned, A_gt, top_k=2):
+def evaluate_graph_recovery(A_learned, A_gt, B_gt=None):
     """
-    Evaluate adjacency recovery for each phase using:
-        (1) Pearson correlation between |A_hat| and |A_gt|
-        (2) F1@k_row: overlap of top-k edges per row
+    Evaluate adjacency recovery per phase using:
+        (1) Pearson corr(|A_hat|, |A_gt|)
+        (2) F1@k_row where k = row degree in B_gt (if provided)
+
+    Args:
+        A_learned : list of [N×N] learned matrices
+        A_gt      : list of [N×N] ground-truth matrices
+        B_gt      : list of binary [N×N] masks (optional)
     """
     from scipy.stats import pearsonr
-
     P = len(A_gt)
     corr, f1 = [], []
 
     for p in range(P):
         A_true = np.abs(A_gt[p])
         A_pred = np.abs(A_learned[p])
-
-        # correlation over off-diagonals
         mask = ~np.eye(A_true.shape[0], dtype=bool)
         r, _ = pearsonr(A_true[mask].ravel(), A_pred[mask].ravel())
         corr.append(r)
 
-        # F1@k_row
         f1_p = []
         for i in range(A_true.shape[0]):
-            true_top = np.argsort(-A_true[i])[:top_k]
-            pred_top = np.argsort(-A_pred[i])[:top_k]
-            inter = len(set(true_top) & set(pred_top))
-            precision = inter / top_k
-            recall = inter / top_k
-            if precision + recall == 0:
-                f1_i = 0.0
+            if B_gt is not None:
+                k = int(B_gt[p][i].sum())
             else:
-                f1_i = 2 * precision * recall / (precision + recall)
+                k = 2
+            true_top = np.argsort(-A_true[i])[:k]
+            pred_top = np.argsort(-A_pred[i])[:k]
+            inter = len(set(true_top) & set(pred_top))
+            precision = inter / max(k, 1)
+            recall = inter / max(k, 1)
+            f1_i = 0.0 if (precision + recall == 0) else (2 * precision * recall / (precision + recall))
             f1_p.append(f1_i)
         f1.append(np.mean(f1_p))
 
