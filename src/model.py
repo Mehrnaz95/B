@@ -10,7 +10,7 @@ Implements:
     • PhaseGraphs        : phase-specific signed adjacency matrices
     • GraphProjector     : message-passing with spectral normalization
     • ARHead             : autoregressive temporal decoder with attention
-    • PS_APM_Seq         : full phase-adaptive sequential model
+    • BACE               : full Behavior-Adaptive Connectivity Estimator
 
 The architecture is identical across real and synthetic data.
 For real data, each region has 10 channels (C=10);
@@ -90,7 +90,6 @@ class PhaseGraphs(nn.Module):
         if use_row_gain:
             self.G = nn.Parameter(torch.zeros(P, N))  # per-phase, per-row gains
 
-    # utility functions
     def _zero_diag(self, X):
         return X * (1.0 - self.I)
 
@@ -220,12 +219,12 @@ class ARHead(nn.Module):
 
 
 # ==============================================================
-#  Full Phase-Adaptive Sequential Model (PS_APM_Seq)
+#  Full Behavior-Adaptive Connectivity Estimator (BACE)
 # ==============================================================
 
-class PS_APM_Seq(nn.Module):
+class BACE(nn.Module):
     """
-    Full phase-adaptive sequential model (BACE backbone).
+    Full Behavior-Adaptive Connectivity Estimator.
 
     Components:
         encoder  : PerRegionGRU
@@ -251,6 +250,8 @@ class PS_APM_Seq(nn.Module):
         A = self.graphs(phases)
         Z = self.proj(Hc, A)
         x_last = X_in[:, :, :, -1]
-        Y_delta = self.head(Z, x_last=None, teacher=teacher, sched_sampling_p=sched_p, A_batch=A if use_neigh else None)
+        Y_delta = self.head(Z, x_last=None, teacher=teacher,
+                            sched_sampling_p=sched_p,
+                            A_batch=A if use_neigh else None)
         Y_hat = x_last.unsqueeze(-1) + Y_delta
         return Y_hat
