@@ -21,12 +21,14 @@ import numpy as np
 import torch
 
 from config import SynthStructuredConfig as Config
-from model import PS_APM_Seq
+from model import BACE
 from data_utils import (
     make_gt_graphs_structured,
     simulate_structured_trials,
     SlidingForecastDataset,
     make_loaders_from_trials,
+    split_by_trials,
+    evaluate_graph_recovery,
 )
 from utils import ensure_dirs, set_seed
 from train_eval import train_full, overlay_examples, save_phase_adjacency_plots
@@ -48,23 +50,24 @@ def main():
     # 1) Generate ground-truth graphs (A_gt)
     # ----------------------------------------------------------
     print("Generating structured suite graphs (𝓓₁–𝓓₄)...")
-    A_gt = make_gt_graphs_structured(cfg)
+    A_gt, B_gt = make_gt_graphs_structured(cfg)
     np.save(os.path.join(cfg.out_dir, "graphs", "A_gt.npy"), A_gt)
+    np.save(os.path.join(cfg.out_dir, "graphs", "B_gt.npy"), B_gt)
 
     # ----------------------------------------------------------
     # 2) Simulate synthetic multivariate time series
     # ----------------------------------------------------------
     print("Simulating synthetic trials...")
     data, labels = simulate_structured_trials(cfg, A_gt)
-    data = data[:, :, None, :] 
+    data = data[:, :, None, :]  # add channel dim (C=1)
     print("Data shape:", data.shape, "| Labels shape:", labels.shape)
 
     # ----------------------------------------------------------
-    # 3) Split into train / val / test (balanced)
+    # 3) Split into train / val / test
     # ----------------------------------------------------------
-    from data_utils import split_by_trials
     train_ids, val_ids, test_ids = split_by_trials(labels, seed=cfg.master_seed)
-    print(f"Trials per phase: {cfg.trials_per_phase} | Train {len(train_ids)}, Val {len(val_ids)}, Test {len(test_ids)}")
+    print(f"Trials per phase: {cfg.trials_per_phase} | "
+          f"Train {len(train_ids)}, Val {len(val_ids)}, Test {len(test_ids)}")
 
     # ----------------------------------------------------------
     # 4) Create Dataset + DataLoaders
@@ -81,7 +84,7 @@ def main():
     # ----------------------------------------------------------
     # 5) Initialize model
     # ----------------------------------------------------------
-    model = PS_APM_Seq(N=cfg.num_nodes, C=1, cfg=cfg).to(cfg.device)
+    model = BACE(N=cfg.num_nodes, C=1, cfg=cfg).to(cfg.device)
 
     # Initialize graphs randomly (no correlation priors for synthetic)
     with torch.no_grad():
@@ -96,11 +99,11 @@ def main():
     # ----------------------------------------------------------
     # 7) Evaluate adjacency recovery
     # ----------------------------------------------------------
-    from data_utils import evaluate_graph_recovery
+    print("Evaluating graph recovery...")
     A_learned = model.graphs.export_eff()
     np.save(os.path.join(cfg.out_dir, "graphs", "A_effective.npy"), A_learned)
 
-    metrics = evaluate_graph_recovery(A_learned, A_gt, top_k=cfg.row_degree)
+    metrics = evaluate_graph_recovery(A_learned, A_gt, B_gt)
     print("Recovery metrics:")
     for p in range(cfg.num_phases):
         print(f"  Phase {p+1}  Corr = {metrics['corr'][p]:.3f}  F1@k_row = {metrics['f1'][p]:.3f}")
@@ -109,12 +112,12 @@ def main():
     np.save(os.path.join(cfg.out_dir, "metrics", "recovery_metrics.npy"), metrics)
 
     # ----------------------------------------------------------
-    # 8) Visualizations (as in Fig. 5B of paper)
+    # 8) Visualization (as in Fig. 5B)
     # ----------------------------------------------------------
     overlay_examples(model, ds, test_loader, cfg, region_idx=0)
     save_phase_adjacency_plots(model, cfg)
 
-    print("Done. Results saved under:", cfg.out_dir)
+    print("\nDone. Results saved under:", cfg.out_dir)
 
 
 # ==============================================================
